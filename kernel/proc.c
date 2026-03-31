@@ -54,6 +54,23 @@ proc_init(void)
     //           vm_page_alloc
     //           vm_page_insert
     // YOUR CODE HERE
+    for(int i = 0; i < NPROC; i++)
+    {
+      struct proc *p = &proc[i];
+
+      p->state = UNUSED;
+      p->kstack = KSTACK(i);
+
+      void *pa = vm_page_alloc();
+      if(pa == 0)
+      {
+        panic("proc_init: kstack alloc");
+      }
+      if(vm_page_insert(kernel_pagetable, (uint64)pa, p->kstack, PTE_R | PTE_W) < 0)
+      {
+        panic("proc_init: kstack map");
+      }
+    }
 }
 
 
@@ -63,7 +80,7 @@ struct proc*
 proc_load_user_init(void)
 {
     void *bin = &_binary_user_init_start;
-    struct proc *p = 0x00;
+    struct proc *p = proc_alloc();
 
     // Allocate a new process. If there is no process avaialble, panic.
     // Use proc_load_elf to load up the elf string. 
@@ -71,7 +88,17 @@ proc_load_user_init(void)
     // for you. The bin pointer points to the embedded BLOB which
     // contains the program image for init.
     // YOUR CODE HERE
+    //p = proc_alloc();
+    if(p== 0)
+    {
+      panic("proc_load_user_init: no available process");
+    }
+    if(proc_load_elf(p, bin) < 0)
+    {
+      panic("proc_load_user_init: failed to load ELF");
+    }
 
+    p->state = RUNNABLE;
     return p;
 }
 
@@ -102,7 +129,39 @@ proc_alloc(void)
     //          memset
     //          proc_pagetable
     // YOUR CODE HERE
-    return 0;
+    for(int i = 0; i < NPROC; i++)
+    {
+      struct proc *p = &proc[i];
+
+      if(p->state == UNUSED)
+      {
+        p->pid = nextpid++;
+
+        // allocate trapframe
+        p->trapframe = (struct trapframe*) vm_page_alloc();
+        if(!p->trapframe)
+        {
+          proc_free(p);
+          return 0;
+        }
+
+        memset(p->trapframe, 0, PGSIZE);
+        p->pagetable = proc_pagetable(p);
+        if(!p->pagetable)
+        {
+          proc_free(p);
+          return 0;
+        }
+
+        p->context.ra = (uint64)usertrapret;
+        p->context.sp = p->kstack + PGSIZE;
+
+        p->state = USED;
+        return p;
+      }
+  }
+  return 0;
+
 }
 
 
@@ -118,6 +177,21 @@ proc_free(struct proc *p)
     //         vm_page_free
     //         proc_free_pagetable
     // YOUR CODE HERE
+  if(p->trapframe)
+  {
+    vm_page_free(p->trapframe);
+  }
+
+  if(p->pagetable)
+  {
+    proc_free_pagetable(p->pagetable, p->sz);
+  }
+
+  p->pid = 0;
+  p->state = UNUSED;
+  p->pagetable = 0;
+  p->trapframe = 0;
+  p->sz = 0;  
 }
 
 
@@ -129,17 +203,17 @@ int
 proc_load_elf(struct proc *p, void *bin)
 {
     struct elfhdr elf;
-    struct proghdr ph;
-    int i, off;
-    uint64 sz=0, sp=0;
-    pagetable_t pagetable=0;
+    struct proghdr *ph;
+    int i;
+    uint64 sz=0;
+    pagetable_t pagetable=0, old = 0;
 
     // get the elf header from bin
     elf = *(struct elfhdr*) bin;
 
     // check the elf magic
     if(elf.magic != ELF_MAGIC)
-        goto bad;
+        return -1;
 
     // We need to load the process from the binary string pointed to
     // by bin. This is similar to xv6's exec function, but with 
@@ -169,9 +243,62 @@ proc_load_elf(struct proc *p, void *bin)
     //       as a hint. You will also need to fully understand how
     //       exec works in xv6. Happy reading!
     // YOUR CODE HERE
+  pagetable = vm_create_pagetable();
+  if(!pagetable)
+  {
+    return -1;
+  }
 
+  ph = (struct proghdr*)((char*)bin + elf.phoff);
+  for(i = 0; i < elf.phnum; i++, ph++)
+  {
+    if(ph->type != ELF_PROG_LOAD)
+    {
+      continue;
+    }
+    uint64 new_sz = ph->vaddr + ph->memsz;
+    if(proc_resize(pagetable, sz, new_sz) == 0)
+    {
+      goto bad;
+    }
+    if(proc_loadseg(pagetable, ph->vaddr, bin, ph->off, ph->filesz) < 0)
+    {
+      goto bad;
+    }
+    sz = new_sz;
+  }
+  sz = PGROUNDUP(sz);
+
+  uint64 stackbase = sz;
+  sz += PGSIZE;
+
+  void *pa = vm_page_alloc();
+  if(!pa)
+  {
+    goto bad;
+  }
+  if(vm_page_insert(pagetable, (uint64)pa, stackbase, PTE_R | PTE_W | PTE_U) < 0)
+  {
+    goto bad;
+  }
+  
+  proc_guard(pagetable, stackbase);
+  p->trapframe->sp = stackbase + PGSIZE;
+
+  old = p->pagetable;
+  p->pagetable = pagetable;
+  p->sz = sz;
+  if(old)
+  {
+    proc_free_pagetable(old, 0);
+  }
+
+  return 0;
 bad:
-    // YOUR CODE HERE
+    if(pagetable)
+    {
+      proc_free_pagetable(pagetable, sz);
+    }
     return -1;
 }
 
@@ -188,7 +315,27 @@ uint64 proc_resize(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
     // xv6 equivalent. What did I change? 
     //
     // YOUR CODE HERE
-    return 0;
+    if(newsz < oldsz)
+        return proc_shrink(pagetable, oldsz, newsz);
+
+    oldsz = PGROUNDUP(oldsz);
+
+    for(uint64 a = oldsz; a < newsz; a += PGSIZE)
+    {
+        void *pa = vm_page_alloc();
+        if(!pa)
+            return 0;
+
+        memset(pa, 0, PGSIZE);
+
+        if(vm_page_insert(pagetable, (uint64)pa, a, PTE_R | PTE_W | PTE_U) < 0)
+        {
+            vm_page_free(pa);
+            return 0;
+        }
+    }
+
+    return newsz; 
 }
 
 
@@ -235,7 +382,26 @@ proc_pagetable(struct proc *p)
     //    vm_page_free
     //    vm_page_remove
     // YOUR CODE HERE
-    return 0;
+    pagetable_t pagetable = vm_create_pagetable();
+    if(!pagetable)
+        return 0;
+
+    // map trampoline
+    if(vm_page_insert(pagetable, (uint64)trampoline, TRAMPOLINE, PTE_R | PTE_X) < 0)
+    {
+        vm_page_free(pagetable);
+        return 0;
+    }
+
+    // map trapframe
+    if(vm_page_insert(pagetable, (uint64)p->trapframe, TRAPFRAME, PTE_R | PTE_W) < 0)
+    {
+        vm_page_remove(pagetable, TRAMPOLINE, 1, 0);
+        vm_page_free(pagetable);
+        return 0;
+    }
+
+    return pagetable;
 }
 
 
@@ -251,6 +417,15 @@ proc_free_pagetable(pagetable_t pagetable, uint64 sz)
     // 3.) Free the user page table.
     // Functions Used: vm_page_remove, proc_freewalk
     // YOUR CODE HERE
+    vm_page_remove(pagetable, TRAMPOLINE, 1, 0);
+    vm_page_remove(pagetable, TRAPFRAME, 1, 0);
+
+    if(sz > 0)
+    {
+        vm_page_remove(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+    }
+
+    proc_freewalk(pagetable);
 }
 
 
@@ -261,15 +436,15 @@ static void
 proc_freewalk(pagetable_t pagetable)
 {
   // there are 2^9 = 512 PTEs in a page table.
-  for(int i = 0; i < 512; i++){
+  for(int i = 0; i < 512; i++)
+  {
     pte_t pte = pagetable[i];
-    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0)
+    {
       // this PTE points to a lower-level page table.
       uint64 child = PTE2PA(pte);
       proc_freewalk((pagetable_t)child);
       pagetable[i] = 0;
-    } else if(pte & PTE_V){
-      panic("freewalk: leaf");
     }
   }
   vm_page_free((void*)pagetable);
@@ -314,8 +489,17 @@ proc_loadseg(pagetable_t pagetable, uint64 va, void *bin, uint offset, uint sz)
   // As an added hint, I have included my variable declarations 
   // above.
   // YOUR CODE HERE
-  
-  return -1;
+  for(i = 0; i < sz; i += PGSIZE)
+    {
+        pa = vm_lookup(pagetable, va + i);
+        if(pa == 0)
+            return -1;
+
+        n = (sz - i < PGSIZE) ? sz - i : PGSIZE;
+        memmove((void*)pa, (char*)bin + offset + i, n);
+    }
+
+    return 0;
 }
 
 
@@ -324,10 +508,8 @@ proc_loadseg(pagetable_t pagetable, uint64 va, void *bin, uint offset, uint sz)
 static void 
 proc_guard(pagetable_t pagetable, uint64 va)
 {
-    pte_t *pte;
-
-    pte = walk_pgtable(pagetable, va, 0);
-    if(pte == 0)
+    pte_t *pte = walk_pgtable(pagetable, va, 0);
+    if(!pte)
         panic("proc_guard");
     *pte &= ~PTE_U;
 }
@@ -337,7 +519,7 @@ proc_guard(pagetable_t pagetable, uint64 va)
 struct proc *proc_find(int pid) {
   // Simply search the proc array, looking for the specified pid.
   // YOUR CODE HERE
-  for(int i=0; i<NPROC; i++){
+  for(int i = 0; i < NPROC; i++){
     if(proc[i].pid == pid){
       return &proc[i];
     }
