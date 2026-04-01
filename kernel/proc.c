@@ -89,7 +89,7 @@ proc_load_user_init(void)
     // contains the program image for init.
     // YOUR CODE HERE
     //p = proc_alloc();
-    if(p== 0)
+    if(!p)
     {
       panic("proc_load_user_init: no available process");
     }
@@ -136,7 +136,7 @@ proc_alloc(void)
       if(p->state == UNUSED)
       {
         p->pid = nextpid++;
-
+        
         // allocate trapframe
         p->trapframe = (struct trapframe*) vm_page_alloc();
         if(!p->trapframe)
@@ -149,10 +149,10 @@ proc_alloc(void)
         p->pagetable = proc_pagetable(p);
         if(!p->pagetable)
         {
-          proc_free(p);
+          vm_page_free(p->trapframe);
           return 0;
         }
-
+        
         p->context.ra = (uint64)usertrapret;
         p->context.sp = p->kstack + PGSIZE;
 
@@ -206,7 +206,7 @@ proc_load_elf(struct proc *p, void *bin)
     struct proghdr *ph;
     int i;
     uint64 sz=0;
-    pagetable_t pagetable=0, old = 0;
+    pagetable_t pagetable=0;
 
     // get the elf header from bin
     elf = *(struct elfhdr*) bin;
@@ -243,7 +243,7 @@ proc_load_elf(struct proc *p, void *bin)
     //       as a hint. You will also need to fully understand how
     //       exec works in xv6. Happy reading!
     // YOUR CODE HERE
-  pagetable = vm_create_pagetable();
+  pagetable = p->pagetable;
   if(!pagetable)
   {
     return -1;
@@ -277,22 +277,17 @@ proc_load_elf(struct proc *p, void *bin)
   {
     goto bad;
   }
-  if(vm_page_insert(pagetable, (uint64)pa, stackbase, PTE_R | PTE_W | PTE_U) < 0)
+  if(vm_page_insert(pagetable, stackbase, (uint64)pa, PTE_R | PTE_W | PTE_U) < 0)
   {
+    vm_page_free(pa);
     goto bad;
   }
   
   proc_guard(pagetable, stackbase);
   p->trapframe->sp = stackbase + PGSIZE;
+  p->trapframe->epc = elf.entry;
 
-  old = p->pagetable;
-  p->pagetable = pagetable;
-  p->sz = sz;
-  if(old)
-  {
-    proc_free_pagetable(old, 0);
-  }
-
+  p->sz = sz;  
   return 0;
 bad:
     if(pagetable)
@@ -315,27 +310,32 @@ uint64 proc_resize(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
     // xv6 equivalent. What did I change? 
     //
     // YOUR CODE HERE
-    if(newsz < oldsz)
-        return proc_shrink(pagetable, oldsz, newsz);
+  uint64 a;
+  void *mem;
 
-    oldsz = PGROUNDUP(oldsz);
+  if(newsz < oldsz)
+    return oldsz;
 
-    for(uint64 a = oldsz; a < newsz; a += PGSIZE)
+  for(a = PGROUNDUP(oldsz); a < newsz; a += PGSIZE)
+  {
+    if(vm_lookup(pagetable, a) != 0)
+      continue;
+
+    mem = vm_page_alloc();
+    if(mem == 0)
+      return 0;
+
+    memset(mem, 0, PGSIZE);
+
+    if(vm_page_insert(pagetable, a, (uint64)mem, PTE_R | PTE_W | PTE_U) < 0)
     {
-        void *pa = vm_page_alloc();
-        if(!pa)
-            return 0;
-
-        memset(pa, 0, PGSIZE);
-
-        if(vm_page_insert(pagetable, (uint64)pa, a, PTE_R | PTE_W | PTE_U) < 0)
-        {
-            vm_page_free(pa);
-            return 0;
-        }
+      vm_page_free(mem);
+      return 0;
     }
+  }
 
-    return newsz; 
+  return newsz;
+    
 }
 
 
@@ -356,6 +356,34 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   // You should also make sure to handle errors as was done in the xv6
   // table.
   // YOUR CODE HERE
+  uint64 va;
+  uint64 pa;
+  void *mem;
+
+  for(va = 0; va < sz; va += PGSIZE)
+  {
+    pa = vm_lookup(old, va);
+    if(pa == 0)
+      goto bad;
+
+    mem = vm_page_alloc();
+    if(mem == 0)
+      goto bad;
+
+    memmove(mem, (void*)pa, PGSIZE);
+
+    // assume user pages are readable, writable, and user-accessible
+    if(vm_page_insert(new, va, (uint64)mem, PTE_R | PTE_W | PTE_U) < 0)
+    {
+      vm_page_free(mem);
+      goto bad;
+    }
+  }
+
+  return 0;
+
+bad:
+  vm_page_remove(new, 0, va / PGSIZE, 1);
   return -1;
 }
 
@@ -387,17 +415,16 @@ proc_pagetable(struct proc *p)
         return 0;
 
     // map trampoline
-    if(vm_page_insert(pagetable, (uint64)trampoline, TRAMPOLINE, PTE_R | PTE_X) < 0)
+    if(vm_page_insert(pagetable, TRAMPOLINE, (uint64)trampoline, PTE_R | PTE_X) < 0)
     {
-        vm_page_free(pagetable);
+        proc_freewalk(pagetable);
         return 0;
     }
 
-    // map trapframe
-    if(vm_page_insert(pagetable, (uint64)p->trapframe, TRAPFRAME, PTE_R | PTE_W) < 0)
+    if(vm_page_insert(pagetable, TRAPFRAME, (uint64)p->trapframe, PTE_R | PTE_W) < 0)
     {
         vm_page_remove(pagetable, TRAMPOLINE, 1, 0);
-        vm_page_free(pagetable);
+        proc_freewalk(pagetable);
         return 0;
     }
 
